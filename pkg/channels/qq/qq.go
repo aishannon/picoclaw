@@ -10,12 +10,19 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sipeed/picoclaw/pkg/media"
+	"github.com/sipeed/picoclaw/pkg/utils"
+	"github.com/tidwall/gjson"
 
 	"github.com/tencent-connect/botgo"
 	"github.com/tencent-connect/botgo/constant"
@@ -43,16 +50,19 @@ const (
 	bytesPerMiB   = 1024 * 1024
 )
 
-type qqAPI interface {
-	WS(ctx context.Context, params map[string]string, body string) (*dto.WebsocketAP, error)
-	PostGroupMessage(
-		ctx context.Context, groupID string, msg dto.APIMessage, opt ...options.Option,
-	) (*dto.Message, error)
-	PostC2CMessage(
-		ctx context.Context, userID string, msg dto.APIMessage, opt ...options.Option,
-	) (*dto.Message, error)
-	Transport(ctx context.Context, method, url string, body any) ([]byte, error)
+type kindType string
+
+func (k kindType) String() string {
+	return string(k)
 }
+
+const (
+	kindDirect kindType = "direct"
+	kindGroup  kindType = "group"
+)
+
+var emojiRegexp = regexp.MustCompile(`<[^<]*?ext="([^"]+)"[^<]*?faceType=(\d+)[^<]*?>|<[^<]*?faceType=(\d+)[^<]*?ext="([^"]+)"[^<]*?>`)
+var extRegexp = regexp.MustCompile(`ext="([^"]+)"`)
 
 type QQChannel struct {
 	*channels.BaseChannel
@@ -65,13 +75,15 @@ type QQChannel struct {
 	downloadFn     func(urlStr, filename string) string
 
 	// Chat routing: track whether a chatID is group or direct.
-	chatType sync.Map // chatID → "group" | "direct"
+	chatType sync.Map // kindType → "group" | "direct"
 
 	// Passive reply: store last inbound message ID per chat.
 	lastMsgID sync.Map // chatID → string
 
-	// msg_seq: per-chat atomic counter for multi-part replies.
-	msgSeqCounters sync.Map // chatID → *atomic.Uint64
+	// SEQ used for deduplication when replying via API.
+	// Passive reply: deduplicate by same chatID+replyMsgID+seq. Active reply: no limit.
+	replySeq atomic.Uint32
+	seqLock  sync.Mutex
 
 	// Time-based dedup replacing the unbounded map.
 	dedup   map[string]time.Time
@@ -125,7 +137,7 @@ func (c *QQChannel) Start(ctx context.Context) error {
 	}
 
 	// initialize OpenAPI client
-	c.api = botgo.NewOpenAPI(c.config.AppID, c.tokenSource).WithTimeout(5 * time.Second)
+	c.api = botgo.NewOpenAPI(c.config.AppID, c.tokenSource).WithTimeout(20 * time.Second)
 
 	// register event handlers
 	intent := event.RegisterHandlers(
@@ -162,7 +174,7 @@ func (c *QQChannel) Start(ctx context.Context) error {
 	// Pre-register reasoning_channel_id as group chat if configured,
 	// so outbound-only destinations are routed correctly.
 	if c.config.ReasoningChannelID != "" {
-		c.chatType.Store(c.config.ReasoningChannelID, "group")
+		c.chatType.Store(c.config.ReasoningChannelID, kindGroup.String())
 	}
 
 	c.SetRunning(true)
@@ -188,40 +200,36 @@ func (c *QQChannel) Stop(ctx context.Context) error {
 // getChatKind returns the chat type for a given chatID ("group" or "direct").
 // Unknown chatIDs default to "group" and log a warning, since QQ group IDs are
 // more common as outbound-only destinations (e.g. reasoning_channel_id).
-func (c *QQChannel) getChatKind(chatID string) string {
+func (c *QQChannel) getChatKind(chatID string) kindType {
 	if v, ok := c.chatType.Load(chatID); ok {
-		if k, ok := v.(string); ok {
+		if k, ok := v.(kindType); ok {
 			return k
 		}
 	}
 	logger.DebugCF("qq", "Unknown chat type for chatID, defaulting to group", map[string]any{
 		"chat_id": chatID,
 	})
-	return "group"
+	return kindGroup
 }
 
-func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
+func (c *QQChannel) saveChatKind(chatID string, kind kindType) {
+	c.chatType.Store(chatID, kind)
+}
+
+// Send sends a message to the specified chatID.
+// First attempt to send a Markdown message, fallback to plain text if failed.
+func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+
+	logger.InfoCF("qq", "Sending message", map[string]any{
+		"chat_id":             msg.ChatID,
+		"content":             msg.Content,
+		"reply_to_message_id": msg.ReplyToMessageID,
+	})
 	if !c.IsRunning() {
-		return nil, channels.ErrNotRunning
+		return channels.ErrNotRunning
 	}
 
-	chatKind := c.getChatKind(msg.ChatID)
 
-	// Build message with content.
-	msgToCreate := &dto.MessageToCreate{
-		Content: msg.Content,
-		MsgType: dto.TextMsg,
-	}
-
-	// Use Markdown message type if enabled in config.
-	if c.config.SendMarkdown {
-		msgToCreate.MsgType = dto.MarkdownMsg
-		msgToCreate.Markdown = &dto.Markdown{
-			Content: msg.Content,
-		}
-		// Clear plain content to avoid sending duplicate text.
-		msgToCreate.Content = ""
-	}
 
 	c.applyPassiveReplyMetadata(msg.ChatID, msgToCreate)
 
@@ -236,29 +244,26 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string
 	}
 
 	// Route to group or C2C.
-	var (
-		sentMsg *dto.Message
-		err     error
-	)
-	if chatKind == "group" {
-		sentMsg, err = c.api.PostGroupMessage(ctx, msg.ChatID, msgToCreate)
-	} else {
-		sentMsg, err = c.api.PostC2CMessage(ctx, msg.ChatID, msgToCreate)
-	}
-
-	if err != nil {
+	mdMsg, textMsg := c.genReplyMsg(ctx, msg)
+	var err error
+	for _, replyMsg := range []dto.MessageToCreate{mdMsg, textMsg} {
+		var replyMsgID *dto.Message
+		if chatKind == kindDirect {
+			replyMsgID, err = c.api.PostC2CMessage(ctx, msg.ChatID, replyMsg)
+		} else {
+			replyMsgID, err = c.api.PostGroupMessage(ctx, msg.ChatID, replyMsg)
+		}
+		if err == nil {
+			logger.InfoCF("qq", "Sent message", map[string]any{"postrsp": replyMsgID})
+			return nil
+		}
 		logger.ErrorCF("qq", "Failed to send message", map[string]any{
 			"chat_id":   msg.ChatID,
 			"chat_kind": chatKind,
 			"error":     err.Error(),
 		})
-		return nil, fmt.Errorf("qq send: %w", channels.ErrTemporary)
 	}
-
-	if sentMsg == nil {
-		return nil, nil
-	}
-	return []string{sentMsg.ID}, nil
+	return err
 }
 
 // StartTyping implements channels.TypingCapable.
@@ -277,6 +282,14 @@ func (c *QQChannel) StartTyping(ctx context.Context, chatID string) (func(), err
 
 	chatKind := c.getChatKind(chatID)
 
+	if chatKind != kindDirect {
+		logger.DebugCF("qq", "Skipping typing for group chat", map[string]any{
+			"chat_id":   chatID,
+			"chat_kind": chatKind,
+		})
+		return func() {}, nil
+	}
+
 	sendTyping := func(sendCtx context.Context) {
 		typingMsg := &dto.MessageToCreate{
 			MsgType: dto.InputNotifyMsg,
@@ -287,13 +300,7 @@ func (c *QQChannel) StartTyping(ctx context.Context, chatID string) (func(), err
 			},
 		}
 
-		var err error
-		if chatKind == "group" {
-			_, err = c.api.PostGroupMessage(sendCtx, chatID, typingMsg)
-		} else {
-			_, err = c.api.PostC2CMessage(sendCtx, chatID, typingMsg)
-		}
-		if err != nil {
+		if _, err := c.api.PostC2CMessage(sendCtx, chatID, typingMsg); err != nil {
 			logger.DebugCF("qq", "Failed to send typing indicator", map[string]any{
 				"chat_id": chatID,
 				"error":   err.Error(),
@@ -325,14 +332,12 @@ func (c *QQChannel) StartTyping(ctx context.Context, chatID string) (func(), err
 // QQ group/C2C media sending is a two-step flow:
 // 1. Upload media to /files using a remote URL or base64-encoded local bytes.
 // 2. Send a msg_type=7 message using the returned file_info.
-func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
+func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+
 	if !c.IsRunning() {
-		return nil, channels.ErrNotRunning
+		return channels.ErrNotRunning
 	}
-
-	chatKind := c.getChatKind(msg.ChatID)
-
-	var messageIDs []string
+	var err error
 	for _, part := range msg.Parts {
 		fileInfo, err := c.uploadMedia(ctx, chatKind, msg.ChatID, part)
 		if err != nil {
@@ -342,26 +347,25 @@ func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage)
 				"error":   err.Error(),
 			})
 			if errors.Is(err, channels.ErrSendFailed) {
-				return nil, err
+				return err
 			}
-			return nil, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
 		}
 
-		sentMsg, err := c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo)
-		if err != nil {
+		if err := c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo); err != nil {
 			logger.ErrorCF("qq", "Failed to send media", map[string]any{
 				"type":    part.Type,
 				"chat_id": msg.ChatID,
 				"error":   err.Error(),
+		if err = c.sendOneMedia(ctx, msg.ChatID, part); err != nil {
+			logger.ErrorCF("qq", "Failed to send media", map[string]any{
+				"part":  part,
+				"error": err.Error(),
 			})
-			return nil, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
-		}
-		if sentMsg != nil && sentMsg.ID != "" {
-			messageIDs = append(messageIDs, sentMsg.ID)
+			continue
 		}
 	}
-
-	return messageIDs, nil
+	return err
 }
 
 type qqMediaUpload struct {
@@ -528,7 +532,7 @@ func (c *QQChannel) sendUploadedMedia(
 	chatKind, chatID string,
 	part bus.MediaPart,
 	fileInfo []byte,
-) (*dto.Message, error) {
+) error {
 	msg := &dto.MessageToCreate{
 		Content: part.Caption,
 		MsgType: dto.RichMediaMsg,
@@ -543,11 +547,11 @@ func (c *QQChannel) sendUploadedMedia(
 	}
 
 	if chatKind == "group" {
-		sentMsg, err := c.api.PostGroupMessage(ctx, chatID, msg)
-		return sentMsg, err
+		_, err := c.api.PostGroupMessage(ctx, chatID, msg)
+		return err
 	}
-	sentMsg, err := c.api.PostC2CMessage(ctx, chatID, msg)
-	return sentMsg, err
+	_, err := c.api.PostC2CMessage(ctx, chatID, msg)
+	return err
 }
 
 func (c *QQChannel) applyPassiveReplyMetadata(chatID string, msg *dto.MessageToCreate) {
@@ -628,6 +632,20 @@ func (c *QQChannel) handleC2CMessage() event.C2CMessageEventHandler {
 		}
 		if content == "" && len(mediaPaths) == 0 {
 			logger.DebugC("qq", "Received empty C2C message with no attachments, ignoring")
+			Username:    data.Author.Username,
+		}
+
+		if !c.IsAllowedSender(sender) {
+			logger.ErrorCF("qq", "Received message from unauthorized sender", map[string]any{
+				"sender": sender,
+			})
+			return nil
+		}
+
+		scope := channels.BuildMediaScope("qq", senderID, data.ID)
+		content, mediaPaths := c.decodeMessage(context.Background(), event, (*dto.Message)(data), scope)
+		if content == "" {
+			logger.DebugC("qq", "Received empty C2C message, ignoring")
 			return nil
 		}
 
@@ -638,18 +656,15 @@ func (c *QQChannel) handleC2CMessage() event.C2CMessageEventHandler {
 		})
 
 		// Store chat routing context.
-		c.chatType.Store(senderID, "direct")
+		c.saveChatKind(senderID, kindDirect)
 		c.lastMsgID.Store(senderID, data.ID)
-
-		// Reset msg_seq counter for new inbound message.
-		c.msgSeqCounters.Store(senderID, new(atomic.Uint64))
 
 		metadata := map[string]string{
 			"account_id": senderID,
 		}
 
 		c.HandleMessage(c.ctx,
-			bus.Peer{Kind: "direct", ID: senderID},
+			bus.Peer{Kind: kindDirect.String(), ID: senderID},
 			data.ID,
 			senderID,
 			senderID,
@@ -697,6 +712,24 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 		}
 
 		// GroupAT event means bot is always mentioned; apply group trigger filtering.
+			Username:    data.Author.Username,
+		}
+
+		if !c.IsAllowedSender(sender) {
+			logger.Infof("qq", "Received group message from unauthorized sender", map[string]any{
+				"sender": sender,
+			})
+			return nil
+		}
+
+		scope := channels.BuildMediaScope("qq", data.GroupID, data.ID)
+
+		content, mediaPaths := c.decodeMessage(context.Background(), event, (*dto.Message)(data), scope)
+		if content == "" {
+			logger.DebugC("qq", "Received empty group message, ignoring")
+			return nil
+		}
+		// GroupAT event means bot is always mentioned; apply group trigger filtering
 		respond, cleaned := c.ShouldRespondInGroup(true, content)
 		if !respond {
 			return nil
@@ -715,11 +748,8 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 		})
 
 		// Store chat routing context using GroupID as chatID.
-		c.chatType.Store(data.GroupID, "group")
+		c.saveChatKind(data.GroupID, kindGroup)
 		c.lastMsgID.Store(data.GroupID, data.ID)
-
-		// Reset msg_seq counter for new inbound message.
-		c.msgSeqCounters.Store(data.GroupID, new(atomic.Uint64))
 
 		metadata := map[string]string{
 			"account_id": senderID,
@@ -727,7 +757,7 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 		}
 
 		c.HandleMessage(c.ctx,
-			bus.Peer{Kind: "group", ID: data.GroupID},
+			bus.Peer{Kind: kindGroup.String(), ID: data.GroupID},
 			data.ID,
 			senderID,
 			data.GroupID,
@@ -949,6 +979,264 @@ func (c *QQChannel) dedupJanitor() {
 	}
 }
 
+func (c *QQChannel) genReplyMsg(ctx context.Context, msg bus.OutboundMessage) (dto.MessageToCreate,
+	dto.MessageToCreate) {
+	replyID, seq := c.getReplyExtInfo(ctx, msg.ChatID)
+
+	mdMsg := dto.MessageToCreate{
+		MsgType: dto.MarkdownMsg,
+		Markdown: &dto.Markdown{
+			Content: msg.Content,
+		},
+		MsgSeq: seq,
+		MsgID:  replyID,
+	}
+
+	textMsg := dto.MessageToCreate{
+		Content: sanitizeURLs(msg.Content),
+		MsgType: dto.TextMsg,
+		MsgSeq:  seq,
+		MsgID:   replyID,
+	}
+
+	return mdMsg, textMsg
+}
+
+func (c *QQChannel) getReplyExtInfo(_ context.Context, chatID string) (replyID string, seq uint32) {
+	// Attach passive reply msg_id and msg_seq if available.
+	if v, ok := c.lastMsgID.Load(chatID); ok {
+		if msgID, ok := v.(string); ok && msgID != "" {
+			replyID = msgID
+		}
+	}
+
+	// Attach msg_seq for active reply.
+	c.seqLock.Lock()
+	defer c.seqLock.Unlock()
+	seq = c.replySeq.Add(1)
+	if seq > math.MaxInt32 {
+		c.replySeq.Store(0)
+		seq = c.replySeq.Add(1)
+	}
+	return replyID, seq
+}
+
+// sendOneMedia uploads a file and sends it via the API.
+// QQ groups do not support file sending.
+// When sending local files via QQ, the file size cannot exceed 10 MB.
+func (c *QQChannel) sendOneMedia(ctx context.Context, chatID string, part bus.MediaPart) error {
+	chatKind := c.getChatKind(chatID)
+
+	mediaPath := part.Ref
+	var meta media.MediaMeta
+	if !isHTTPURL(mediaPath) {
+		store := c.GetMediaStore()
+		if store == nil {
+			logger.WarnCF("qq", "QQ media requires HTTP/HTTPS URL, no media store available", map[string]any{
+				"ref": part.Ref,
+			})
+			return fmt.Errorf("store not available")
+		}
+		var resolved string
+		var err error
+		resolved, meta, err = store.ResolveWithMeta(part.Ref)
+		if err != nil {
+			logger.ErrorCF("qq", "Failed to resolve media ref", map[string]any{
+				"ref":   part.Ref,
+				"error": err.Error(),
+			})
+			return fmt.Errorf("store resolve failed")
+		}
+		mediaPath = resolved
+	}
+
+	// Map part type to QQ file type: 1=image, 2=video, 3=audio, 4=file.
+	var fileType uint64
+	switch part.Type {
+	case "image":
+		fileType = 1
+	case "video":
+		fileType = 2
+	case "audio":
+		fileType = 3
+	default:
+		fileType = 4 // file
+	}
+
+	richMedia := &RichMediaMessage{FileType: fileType}
+	if isHTTPURL(mediaPath) {
+		richMedia.URL = mediaPath
+	} else {
+		fdata, err := os.ReadFile(mediaPath)
+		if err != nil {
+			logger.ErrorCF("qq", "Failed to read media file", map[string]any{"path": mediaPath,
+				"error": err.Error()})
+			return fmt.Errorf("qq send media: read file failed: %w", channels.ErrSendFailed)
+		}
+		richMedia.FileData = fdata
+		richMedia.FileName = meta.Filename
+	}
+
+	if chatKind == kindGroup && fileType == 4 {
+		logger.WarnCF("qq", "Group does not support file send", map[string]any{
+			"filename": richMedia.FileName})
+		return fmt.Errorf("qq send media: group does not support file send: %w", channels.ErrSendFailed)
+	}
+
+	if len(richMedia.FileData) > 10*1024*1024 {
+		logger.WarnCF("qq", "File size exceeds 10M, skipping send", map[string]any{
+			"filename": richMedia.FileName, "size": len(richMedia.FileData)})
+		return fmt.Errorf("qq send media: file size exceeds 10M: %w ", channels.ErrSendFailed)
+	}
+
+	var sendErr error
+	var result *dto.Message
+	if chatKind == kindDirect {
+		result, sendErr = c.api.PostC2CMessage(ctx, chatID, richMedia)
+	} else {
+		result, sendErr = c.api.PostGroupMessage(ctx, chatID, richMedia)
+	}
+
+	if sendErr != nil {
+		logger.ErrorCF("qq", "Failed to send media", map[string]any{
+			"type":    part.Type,
+			"chat_id": chatID,
+			"error":   sendErr.Error(),
+		})
+		return fmt.Errorf("qq send media: %w err:%v", channels.ErrTemporary, sendErr)
+	}
+
+	msg := dto.MessageToCreate{
+		MsgType: dto.RichMediaMsg,
+		Media:   &dto.MediaInfo{FileInfo: result.FileInfo},
+	}
+	msg.MsgID, msg.MsgSeq = c.getReplyExtInfo(ctx, chatID)
+
+	if chatKind == kindDirect {
+		result, sendErr = c.api.PostC2CMessage(ctx, chatID, msg)
+	} else {
+		result, sendErr = c.api.PostGroupMessage(ctx, chatID, msg)
+	}
+	if sendErr != nil {
+		logger.ErrorCF("qq", "Failed to send media", map[string]any{
+			"type":    part.Type,
+			"chat_id": chatID,
+			"error":   sendErr.Error(),
+		})
+		return fmt.Errorf("qq send media: %w err:%v", channels.ErrTemporary, sendErr)
+	}
+	return nil
+}
+
+func (c *QQChannel) decodeMessage(ctx context.Context, event *dto.WSPayload, data *dto.Message,
+	scope string) (content string, mediaPaths []string) {
+
+	content = parseEmojiText(data.Content)
+	wavURL, asrReferText := getVoiceInfo(event)
+	var attachments []MessageAttachment
+	for _, att := range data.Attachments {
+		if att.ContentType == "voice" && wavURL != "" {
+			attachments = append(attachments, MessageAttachment{
+				ContentType:  "voice",
+				URL:          wavURL,
+				FileName:     filepath.Base(wavURL),
+				AsrReferText: asrReferText,
+			})
+			continue
+		}
+		attachments = append(attachments, MessageAttachment{
+			ContentType: att.ContentType,
+			URL:         att.URL,
+			FileName:    att.FileName,
+		})
+	}
+	processedPaths, attachmentContent := c.processAttachments(ctx, attachments, scope)
+	if asrReferText != "" {
+		attachmentContent = fmt.Sprintf("[audio: %v]", asrReferText)
+	}
+	mediaPaths = processedPaths
+	if content != "" {
+		content += "\n"
+	}
+	content += attachmentContent
+	return content, mediaPaths
+}
+
+// processAttachments processes all attachments in a message
+func (c *QQChannel) processAttachments(ctx context.Context, attachments []MessageAttachment,
+	scope string) (mediaPaths []string, content string) {
+
+	// Helper to register a local file with the media store
+	storeMedia := func(localPath, filename string) string {
+		store := c.GetMediaStore()
+		if store == nil {
+			logger.ErrorCF("qq", "media store is nil", map[string]any{
+				"scope": scope,
+			})
+			return ""
+		}
+		ref, err := store.Store(localPath, media.MediaMeta{Filename: filename, Source: "qq"}, scope)
+		if err == nil {
+			logger.InfoCF("qq", "Stored media", map[string]any{
+				"scope":     scope,
+				"localPath": localPath,
+				"filename":  filename,
+			})
+			return ref
+		}
+		logger.ErrorCF("qq", "Stored media err ", map[string]any{
+			"scope":     scope,
+			"localPath": localPath,
+			"err":       err.Error(),
+		})
+		return localPath
+	}
+
+	for _, attachment := range attachments {
+		attachmentType := c.getAttachmentType(attachment)
+		localPath := c.downloadAttachment(ctx, attachment)
+		if localPath == "" {
+			mediaPaths = append(mediaPaths, attachment.URL)
+			content = appendContent(content, fmt.Sprintf("[%v: %s]", attachment.ContentType, attachment.URL))
+			continue
+		}
+		ref := storeMedia(localPath, attachment.FileName)
+		mediaPaths = append(mediaPaths, ref)
+		if attachmentType == "audio" && attachment.AsrReferText != "" {
+			content = appendContent(content, fmt.Sprintf("[audio: %s]", attachment.AsrReferText))
+			continue
+		}
+		content = appendContent(content, fmt.Sprintf("[%v: %s]", attachment.ContentType, ref))
+	}
+
+	return mediaPaths, content
+}
+
+// downloadAttachment downloads an attachment from QQ server
+func (c *QQChannel) downloadAttachment(ctx context.Context, attachment MessageAttachment) string {
+	logger.InfoCF("qq", "Downloading attachment", map[string]any{
+		"attachment": attachment,
+	})
+	return utils.DownloadFile(attachment.URL, attachment.FileName, utils.DownloadOptions{
+		LoggerPrefix: "qq",
+	})
+}
+
+// getAttachmentType determines the type of attachment (image, audio, video, file)
+func (c *QQChannel) getAttachmentType(attachment MessageAttachment) string {
+
+	if strings.HasPrefix(attachment.ContentType, "image") {
+		return "image"
+	}
+	if strings.HasPrefix(attachment.ContentType, "video") {
+		return "video"
+	}
+	if strings.HasPrefix(attachment.ContentType, "voice") {
+		return "audio"
+	}
+	return "file"
+}
+
 // isHTTPURL returns true if s starts with http:// or https://.
 func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
@@ -1003,7 +1291,70 @@ func sanitizeURLs(text string) string {
 	})
 }
 
-// VoiceCapabilities returns the voice capabilities of the channel.
-func (c *QQChannel) VoiceCapabilities() channels.VoiceCapabilities {
-	return channels.VoiceCapabilities{ASR: true, TTS: true}
+// appendContent safely appends content to existing text
+func appendContent(content, suffix string) string {
+	if content == "" {
+		return suffix
+	}
+	return content + "\n" + suffix
+}
+
+func getVoiceInfo(event *dto.WSPayload) (string, string) {
+	_raw, err := json.Marshal(event.Data)
+	if err != nil {
+		logger.ErrorCF("qq", "Failed to marshal event data", map[string]any{
+			"error": err.Error(),
+		})
+		return "", ""
+	}
+	// Use gjson to extract the voice_wav_url field.
+	rawJSON := string(_raw)
+
+	// Try to extract voice_wav_url from the first element of the attachments array.
+	voiceWavURL := gjson.Get(rawJSON, "attachments.0.voice_wav_url").String()
+	asrReferText := gjson.Get(rawJSON, "attachments.0.asr_refer_text").String()
+	logger.DebugCF("qq", "Found voice_wav_url in attachments", map[string]any{
+		"url": voiceWavURL, "asr_refer_text": asrReferText,
+	})
+	return voiceWavURL, asrReferText
+}
+
+// parseEmojiText decodes emoji text
+func parseEmojiText(content string) string {
+	content = strings.ReplaceAll(content, `\\`, `\`)
+	content = strings.ReplaceAll(content, "\\u003c", "<")
+	content = strings.ReplaceAll(content, "\\u003e", ">")
+	content = strings.ReplaceAll(content, `\"`, `"`)
+
+	contentParts := emojiRegexp.Split(content, -1)
+	matches := emojiRegexp.FindAllString(content, -1)
+
+	var result strings.Builder
+	for i, part := range contentParts {
+		if strings.TrimSpace(part) != "" {
+			result.WriteString(part)
+		}
+		if i < len(matches) {
+			match := matches[i]
+			if strings.Contains(match, "faceType=") {
+				result.WriteString(processEmoji(match))
+			}
+		}
+	}
+
+	return result.String()
+}
+
+func processEmoji(match string) string {
+	extMatch := extRegexp.FindStringSubmatch(match)
+	if len(extMatch) > 1 {
+		ext, err := base64.StdEncoding.DecodeString(extMatch[1])
+		if err == nil {
+			var faceDesc map[string]string
+			if err = json.Unmarshal(ext, &faceDesc); err == nil {
+				return fmt.Sprintf("[表情 %v]", faceDesc["text"])
+			}
+		}
+	}
+	return ""
 }
