@@ -114,7 +114,7 @@ func NewQQChannel(cfg config.QQConfig, messageBus *bus.MessageBus) (*QQChannel, 
 }
 
 func (c *QQChannel) Start(ctx context.Context) error {
-	if c.config.AppID == "" || c.config.AppSecret.IsZero() {
+	if c.config.AppID == "" || c.config.AppSecret.String() == "" {
 		return fmt.Errorf("QQ app_id and app_secret not configured")
 	}
 
