@@ -328,7 +328,6 @@ func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage)
 		return channels.ErrNotRunning
 	}
 	chatKind := c.getChatKind(msg.ChatID)
-	var err error
 	for _, part := range msg.Parts {
 		fileInfo, err := c.uploadMedia(ctx, chatKind, msg.ChatID, part)
 		if err != nil {
@@ -349,10 +348,10 @@ func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage)
 				"chat_id": msg.ChatID,
 				"error":   err.Error(),
 			})
-			continue
+			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
 		}
 	}
-	return err
+	return nil
 }
 
 func (c *QQChannel) uploadMedia(ctx context.Context,
@@ -582,8 +581,7 @@ func (c *QQChannel) handleC2CMessage() event.C2CMessageEventHandler {
 			return nil
 		}
 
-		scope := channels.BuildMediaScope("qq", senderID, data.ID)
-		content, mediaPaths := c.decodeMessage(context.Background(), event, (*dto.Message)(data), scope)
+		content, mediaPaths := c.decodeMessage(context.Background(), senderID, event, (*dto.Message)(data))
 		if content == "" && len(mediaPaths) == 0 {
 			logger.DebugC("qq", "Received empty C2C message with no content/attachments, ignoring")
 			return nil
@@ -648,8 +646,7 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 			return nil
 		}
 
-		scope := channels.BuildMediaScope("qq", data.GroupID, data.ID)
-		content, mediaPaths := c.decodeMessage(context.Background(), event, (*dto.Message)(data), scope)
+		content, mediaPaths := c.decodeMessage(context.Background(), senderID, event, (*dto.Message)(data))
 		if content == "" {
 			logger.DebugC("qq", "Received empty group message, ignoring")
 			return nil
@@ -697,7 +694,7 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 }
 
 func (c *QQChannel) extractInboundAttachments(chatID, messageID string,
-	attachments []*dto.MessageAttachment) ([]string, []string) {
+	attachments []MessageAttachment) ([]string, []string) {
 
 	if len(attachments) == 0 {
 		return nil, nil
@@ -707,7 +704,7 @@ func (c *QQChannel) extractInboundAttachments(chatID, messageID string,
 	mediaPaths := make([]string, 0, len(attachments))
 	notes := make([]string, 0, len(attachments))
 
-	storeMedia := func(localPath string, attachment *dto.MessageAttachment) string {
+	storeMedia := func(localPath string, attachment MessageAttachment) string {
 		if store := c.GetMediaStore(); store != nil {
 			ref, err := store.Store(localPath, media.MediaMeta{
 				Filename:      qqAttachmentFilename(attachment),
@@ -723,17 +720,12 @@ func (c *QQChannel) extractInboundAttachments(chatID, messageID string,
 	}
 
 	for _, attachment := range attachments {
-		if attachment == nil {
-			continue
-		}
-
 		filename := qqAttachmentFilename(attachment)
 		if localPath := c.downloadAttachment(attachment.URL, filename); localPath != "" {
 			mediaPaths = append(mediaPaths, storeMedia(localPath, attachment))
 		} else if attachment.URL != "" {
 			mediaPaths = append(mediaPaths, attachment.URL)
 		}
-
 		notes = append(notes, qqAttachmentNote(attachment))
 	}
 
@@ -776,10 +768,7 @@ func (c *QQChannel) downloadHeaders() map[string]string {
 	return headers
 }
 
-func qqAttachmentFilename(attachment *dto.MessageAttachment) string {
-	if attachment == nil {
-		return "attachment"
-	}
+func qqAttachmentFilename(attachment MessageAttachment) string {
 	if attachment.FileName != "" {
 		return attachment.FileName
 	}
@@ -803,11 +792,7 @@ func qqAttachmentFilename(attachment *dto.MessageAttachment) string {
 	}
 }
 
-func qqAttachmentKind(attachment *dto.MessageAttachment) string {
-	if attachment == nil {
-		return "file"
-	}
-
+func qqAttachmentKind(attachment MessageAttachment) string {
 	contentType := strings.ToLower(attachment.ContentType)
 	filename := strings.ToLower(attachment.FileName)
 
@@ -832,7 +817,7 @@ func qqAttachmentKind(attachment *dto.MessageAttachment) string {
 	}
 }
 
-func qqAttachmentNote(attachment *dto.MessageAttachment) string {
+func qqAttachmentNote(attachment MessageAttachment) string {
 	filename := qqAttachmentFilename(attachment)
 
 	switch qqAttachmentKind(attachment) {
@@ -841,6 +826,9 @@ func qqAttachmentNote(attachment *dto.MessageAttachment) string {
 	case "audio":
 		return fmt.Sprintf("[audio: %s]", filename)
 	case "video":
+		if attachment.AsrReferText != "" {
+			return fmt.Sprintf("[video: %s]", attachment.AsrReferText)
+		}
 		return fmt.Sprintf("[video: %s]", filename)
 	default:
 		return fmt.Sprintf("[file: %s]", filename)
@@ -945,10 +933,9 @@ func (c *QQChannel) getReplyExtInfo(ctx context.Context, chatID string) (replyID
 	return replyID, seq
 }
 
-func (c *QQChannel) decodeMessage(ctx context.Context, event *dto.WSPayload, data *dto.Message,
-	scope string) (content string, mediaPaths []string) {
-
-	content = parseEmojiText(data.Content)
+func (c *QQChannel) decodeMessage(ctx context.Context, chatID string, event *dto.WSPayload,
+	data *dto.Message) (string, []string) {
+	content := parseEmojiText(data.Content)
 	wavURL, asrReferText := getVoiceInfo(event)
 	var attachments []MessageAttachment
 	for _, att := range data.Attachments {
@@ -967,63 +954,11 @@ func (c *QQChannel) decodeMessage(ctx context.Context, event *dto.WSPayload, dat
 			FileName:    att.FileName,
 		})
 	}
-	processedPaths, attachmentContent := c.processAttachments(ctx, attachments, scope)
-	mediaPaths = processedPaths
-	if content != "" {
-		content += "\n"
+	processedPaths, attachmentContents := c.extractInboundAttachments(chatID, data.ID, attachments)
+	for _, note := range attachmentContents {
+		content = appendContent(content, note)
 	}
-	content += attachmentContent
-	return content, mediaPaths
-}
-
-// processAttachments processes all attachments in a message
-func (c *QQChannel) processAttachments(ctx context.Context, attachments []MessageAttachment,
-	scope string) (mediaPaths []string, content string) {
-
-	// Helper to register a local file with the media store
-	storeMedia := func(localPath, filename string) string {
-		store := c.GetMediaStore()
-		if store == nil {
-			logger.ErrorCF("qq", "media store is nil", map[string]any{
-				"scope": scope,
-			})
-			return ""
-		}
-		ref, err := store.Store(localPath, media.MediaMeta{Filename: filename, Source: "qq"}, scope)
-		if err == nil {
-			logger.InfoCF("qq", "Stored media", map[string]any{
-				"scope":     scope,
-				"localPath": localPath,
-				"filename":  filename,
-			})
-			return ref
-		}
-		logger.ErrorCF("qq", "Stored media err ", map[string]any{
-			"scope":     scope,
-			"localPath": localPath,
-			"err":       err.Error(),
-		})
-		return localPath
-	}
-
-	for _, attachment := range attachments {
-		attachmentType := c.getAttachmentType(attachment)
-		ref := attachment.URL
-		localPath := c.downloadAttachment(attachment.URL, attachment.FileName)
-		if localPath != "" {
-			if ref = storeMedia(localPath, attachment.FileName); ref == "" {
-				ref = localPath
-			}
-		}
-		if attachmentType == "audio" && attachment.AsrReferText != "" {
-			content = appendContent(content, fmt.Sprintf("[audio: %s]", attachment.AsrReferText))
-		} else {
-			content = appendContent(content, fmt.Sprintf("[%v: %s]", attachmentType, ref))
-		}
-		mediaPaths = append(mediaPaths, ref)
-	}
-
-	return mediaPaths, content
+	return content, processedPaths
 }
 
 // getAttachmentType determines the type of attachment (image, audio, video, file)
