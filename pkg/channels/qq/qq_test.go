@@ -203,7 +203,7 @@ func TestSendMedia_UploadsLocalFileAsBase64(t *testing.T) {
 	}
 	ch.SetRunning(true)
 	ch.SetMediaStore(store)
-	ch.chatType.Store("group-1", "group")
+	ch.chatType.Store("group-1", kindGroup)
 	ch.lastMsgID.Store("group-1", "msg-1")
 
 	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
@@ -434,7 +434,7 @@ func TestSendMedia_UsesRemoteURLUploadForC2C(t *testing.T) {
 	if upload.body.URL != "https://cdn.example.com/report.pdf" {
 		t.Fatalf("upload URL = %q", upload.body.URL)
 	}
-	if len(upload.body.FileData) > 0 {
+	if len(upload.body.FileData) != 0 {
 		t.Fatalf("upload file_data = %q, want empty", upload.body.FileData)
 	}
 	if upload.body.FileType != 4 {
