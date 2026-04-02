@@ -222,7 +222,7 @@ func (c *QQChannel) saveChatKind(chatID string, kind kindType) {
 
 // Send sends a message to the specified chatID.
 // First attempt to send a Markdown message, fallback to plain text if failed.
-func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
 
 	logger.InfoCF("qq", "Sending message", map[string]any{
 		"chat_id":             msg.ChatID,
@@ -230,7 +230,7 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		"reply_to_message_id": msg.ReplyToMessageID,
 	})
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	chatKind := c.getChatKind(msg.ChatID)
@@ -245,7 +245,7 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		}
 		if err == nil {
 			logger.InfoCF("qq", "Sent message", map[string]any{"postrsp": replyMsgID})
-			return nil
+			return []string{replyMsgID.ID}, nil
 		}
 		logger.ErrorCF("qq", "Failed to send message", map[string]any{
 			"chat_id":   msg.ChatID,
@@ -253,7 +253,7 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 			"error":     err.Error(),
 		})
 	}
-	return err
+	return nil, err
 }
 
 // StartTyping implements channels.TypingCapable.
@@ -322,12 +322,13 @@ func (c *QQChannel) StartTyping(ctx context.Context, chatID string) (func(), err
 // QQ group/C2C media sending is a two-step flow:
 // 1. Upload media to /files using a remote URL or local bytes.
 // 2. Send a msg_type=7 message using the returned file_info.
-func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
 
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 	chatKind := c.getChatKind(msg.ChatID)
+	var messageIDs []string
 	for _, part := range msg.Parts {
 		fileInfo, err := c.uploadMedia(ctx, chatKind, msg.ChatID, part)
 		if err != nil {
@@ -337,21 +338,25 @@ func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage)
 				"error":   err.Error(),
 			})
 			if errors.Is(err, channels.ErrSendFailed) {
-				return err
+				return nil, err
 			}
-			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+			return nil, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
 		}
 
-		if err = c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo); err != nil {
+		sentMsg, err := c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo)
+		if err != nil {
 			logger.ErrorCF("qq", "Failed to send media", map[string]any{
 				"type":    part.Type,
 				"chat_id": msg.ChatID,
 				"error":   err.Error(),
 			})
-			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+			return messageIDs, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+		}
+		if sentMsg != nil && sentMsg.ID != "" {
+			messageIDs = append(messageIDs, sentMsg.ID)
 		}
 	}
-	return nil
+	return messageIDs, nil
 }
 
 func (c *QQChannel) uploadMedia(ctx context.Context,
@@ -501,7 +506,7 @@ func (c *QQChannel) outboundMediaType(part bus.MediaPart, localPath string) stri
 
 // Fix the sendUploadedMedia function syntax error
 func (c *QQChannel) sendUploadedMedia(ctx context.Context, chatKind kindType, chatID string, part bus.MediaPart,
-	fileInfo []byte) error {
+	fileInfo []byte) (*dto.Message, error) {
 
 	msg := &dto.MessageToCreate{
 		Content: part.Caption,
@@ -516,11 +521,9 @@ func (c *QQChannel) sendUploadedMedia(ctx context.Context, chatKind kindType, ch
 		if msg.Content != "" {
 			msg.Content = sanitizeURLs(msg.Content)
 		}
-		_, err := c.api.PostGroupMessage(ctx, chatID, msg)
-		return err
+		return c.api.PostGroupMessage(ctx, chatID, msg)
 	}
-	_, err := c.api.PostC2CMessage(ctx, chatID, msg)
-	return err
+	return c.api.PostC2CMessage(ctx, chatID, msg)
 }
 
 func (c *QQChannel) mediaUploadURL(chatKind kindType, chatID string) string {
